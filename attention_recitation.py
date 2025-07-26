@@ -20,6 +20,7 @@ class AgentState(TypedDict):
     task: str
     todo_md: str
     step_results: List[str]
+    completed_todos: List[str]  # Track completed tasks
     step_count: int
 
 
@@ -59,7 +60,7 @@ def summarize_text(text: str) -> str:
     model = ChatOpenAI(model="gpt-4.1-mini", temperature=None)
     response = model.invoke(messages)
 
-    return response.choices[0].message["content"]
+    return response.content
 
 
 # -------------------- Tool Schemas --------------------
@@ -89,17 +90,17 @@ tool_definitions = [
 ]
 
 
-# -------------------- TODO File Management --------------------
-def load_todo():
-    return open(TODO_FILE).read() if os.path.exists(TODO_FILE) else ""
+def get_next_todo_item(todo_md: str) -> str:
+    """Parse the TODO markdown and return the next uncompleted item."""
+    lines = todo_md.strip().split("\n")
+    for line in lines:
+        line = line.strip()
+        if line.startswith("- [ ]") or line.startswith("* [ ]"):
+            # Remove the checkbox and return the task description
+            return line.replace("- [ ]", "").replace("* [ ]", "").strip()
+    return None
 
 
-def save_todo(todo: str):
-    with open(TODO_FILE, "w") as f:
-        f.write(todo)
-
-
-# -------------------- Initialization --------------------
 def initialize_agent(task: str) -> AgentState:
     messages = [
         {
@@ -110,53 +111,79 @@ def initialize_agent(task: str) -> AgentState:
     ]
     model = ChatOpenAI(model="gpt-4.1-mini", temperature=None)
     response = model.invoke(messages)
-    print(">>>>> message ", response)
+    # print(">>>>> message ", response)
     todo_md = response.content
-    save_todo(todo_md)
 
-    return {"task": task, "todo_md": todo_md, "step_results": [], "step_count": 0}
+    return {
+        "task": task,
+        "todo_md": todo_md,
+        "step_results": [],
+        "step_count": 0,
+        "completed_todos": [],
+    }
 
 
-# -------------------- Perform Step (with Function Calling) --------------------
 def perform_next_step(state: AgentState) -> AgentState:
+    # Get the next specific TODO item to work on
+    next_item = get_next_todo_item(state["todo_md"])
+    print("Next Task: ", next_item)
+    if not next_item:
+        state["step_results"].append("No more TODO items found.")
+        return {**state, "step_count": state["step_count"] + 1}
+
     messages = [
         {
             "role": "system",
-            "content": "Pick the next step from the TODO list and call the right tool.",
+            "content": "You must work on ONLY one task at a time. Call the appropriate tool to complete this exact task.",
         },
         {
             "role": "user",
-            "content": f"Task: {state['task']}\n\nTODO.md:\n{state['todo_md']}\n\nPrevious Results:\n"
-            + "\n".join(state["step_results"]),
+            "content": f"""
+Context:
+
+Overall Task: {state['task']}
+
+Todo List:
+{state['todo_md']}
+
+Previous Results:
+{ "\n".join(state["step_results"]) }
+
+Complete this specific TODO item: {next_item}. Only focus on this task.
+""",
         },
     ]
     model = ChatOpenAI(
         model="gpt-4.1-mini",
         temperature=None,
-        # tools=tool_definitions,
-        # tool_choice="auto",
     )
-    model = model.bind_tools(tools=tool_definitions, tool_choice="auto")
+    model = model.bind_tools(tools=[search_web, summarize_text], tool_choice="auto")
     response = model.invoke(messages)
-    print(">>>>> response111 ", response)
-    tool_call = response.tool_calls[0]
-    print(">>>>> response111 ", tool_call)
-    if not tool_call:
-        state["step_results"].append("No tool selected.")
+    if not response.tool_calls:
+        state["step_results"].append(response.content)
+        state["completed_todos"].append(next_item)
         return {**state, "step_count": state["step_count"] + 1}
 
-    name = tool_call["name"]
-    # args = json.loads(tool_call["args"])
-    args = tool_call["args"]
+    # Process all tool calls and aggregate results
+    tool_results = []
+    for tool_call in response.tool_calls:
+        # print(">>>>> tool_call ", tool_call)
+        name = tool_call["name"]
+        args = tool_call["args"]
 
-    if name == "search_web":
-        result = search_web(args["query"])
-    elif name == "summarize_text":
-        result = summarize_text(args["text"])
-    else:
-        result = f"Unknown tool: {name}"
+        if name == "search_web":
+            result = search_web.invoke(args["query"])
+        elif name == "summarize_text":
+            result = summarize_text.invoke(args["text"])
+        else:
+            result = f"Unknown tool: {name}"
 
-    state["step_results"].append(f"[{name}] {result}")
+        tool_results.append(f"[{name}] {result}")
+
+    # Aggregate all tool results for this step
+    aggregated_result = f"Working on: '{next_item}' -> " + " | ".join(tool_results)
+    state["step_results"].append(aggregated_result)
+    state["completed_todos"].append(next_item)
     return {**state, "step_count": state["step_count"] + 1}
 
 
@@ -165,12 +192,18 @@ def update_todo(state: AgentState) -> AgentState:
     messages = [
         {
             "role": "system",
-            "content": "Update the TODO.md list by checking off what’s completed, based on the latest results.",
+            "content": "Update the TODO.md list by checking off what’s completed, based on completed todos and step count.",
         },
         {
             "role": "user",
-            "content": f"Task: {state['task']}\n\nPrevious TODO.md:\n{state['todo_md']}\n\nStep Results:\n"
-            + "\n".join(state["step_results"]),
+            "content": f"""
+Completed todos: {", ".join(state['completed_todos'])}
+Step count: {state['step_count']}
+
+Here is the TODO.md:
+{state['todo_md']}
+
+""",
         },
     ]
 
@@ -178,19 +211,15 @@ def update_todo(state: AgentState) -> AgentState:
     response = model.invoke(messages)
     updated_todo = response.content
 
-    save_todo(updated_todo)
-
     return {**state, "todo_md": updated_todo}
 
 
-# -------------------- Loop Control --------------------
 def is_done(state: AgentState) -> str:
     if "[ ]" in state["todo_md"] and state["step_count"] < 10:
         return "continue"
     return END
 
 
-# -------------------- LangGraph Setup --------------------
 def build_agent():
     builder = StateGraph(AgentState)
     builder.add_node("perform_next_step", perform_next_step)
@@ -203,12 +232,25 @@ def build_agent():
     return builder.compile()
 
 
-# -------------------- Run Agent --------------------
 if __name__ == "__main__":
     user_task = "Research 3 AI startups and summarize their impact."
     state = initialize_agent(user_task)
     agent = build_agent()
 
+    final_state = None
     for step in agent.stream(state, stream_mode="values"):
         print(f"\n🔁 Step {step['step_count']} — TODO.md:\n{step['todo_md']}\n")
-        print("📝 Step Results:\n", "\n---\n".join(step["step_results"]))
+        final_state = step
+
+    print("\n" + "=" * 50)
+    print("🎯 FINAL RESULTS")
+    print("=" * 50)
+    print(f"Task: {final_state['task']}")
+    print(f"\nCompleted in {final_state['step_count']} steps")
+    print(f"\nFinal TODO Status:\n{final_state['todo_md']}")
+    print(f"\nLast Step Result:")
+    if final_state["step_results"]:
+        print(f"{final_state['step_results'][-1]}")
+    else:
+        print("No step results available")
+    print("=" * 50)

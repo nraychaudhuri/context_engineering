@@ -16,10 +16,10 @@ def exa_search(query: str) -> list[dict[str, str]]:
             {
                 "url": n.url,
                 "title": n.title,
-                "summary": n.text,
+                "summary": n.text[:100],
             }
         )
-    print(">>>>")
-    print(response)
-    print(">>>>")
+    # print(">>>>")
+    # print(response)
+    # print(">>>>")
     return response
