@@ -7,7 +7,7 @@ from langchain_core.tools import tool
 import json
 from tools.exa_tool import exa_search
 from dotenv import load_dotenv
-
+from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
 
 load_dotenv()
@@ -63,33 +63,6 @@ def summarize_text(text: str) -> str:
     return response.content
 
 
-# -------------------- Tool Schemas --------------------
-tool_definitions = [
-    {
-        "name": "search_web",
-        "description": "Search the web for a given query.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "The search query."}
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "summarize_text",
-        "description": "Summarize the input text.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "The text to summarize."}
-            },
-            "required": ["text"],
-        },
-    },
-]
-
-
 def get_next_todo_item(todo_md: str) -> str:
     """Parse the TODO markdown and return the next uncompleted item."""
     lines = todo_md.strip().split("\n")
@@ -131,14 +104,17 @@ def perform_next_step(state: AgentState) -> AgentState:
         state["step_results"].append("No more TODO items found.")
         return {**state, "step_count": state["step_count"] + 1}
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You must work on ONLY one task at a time. Call the appropriate tool to complete this exact task.",
-        },
-        {
-            "role": "user",
-            "content": f"""
+    # Create ReAct agent with tools
+    model = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+    tools = [search_web, summarize_text]
+    react_agent = create_react_agent(model, tools)
+
+    # Prepare input for the ReAct agent
+    agent_input = {
+        "messages": [
+            (
+                "human",
+                f"""
 Context:
 
 Overall Task: {state['task']}
@@ -147,43 +123,32 @@ Todo List:
 {state['todo_md']}
 
 Previous Results:
-{ "\n".join(state["step_results"]) }
+{chr(10).join(state["step_results"])}
 
 Complete this specific TODO item: {next_item}. Only focus on this task.
+Use the available tools to gather information and complete the task.
 """,
-        },
-    ]
-    model = ChatOpenAI(
-        model="gpt-4.1-mini",
-        temperature=None,
-    )
-    model = model.bind_tools(tools=[search_web, summarize_text], tool_choice="auto")
-    response = model.invoke(messages)
-    if not response.tool_calls:
-        state["step_results"].append(response.content)
+            )
+        ]
+    }
+
+    # Run the ReAct agent
+    try:
+        result = react_agent.invoke(agent_input)
+
+        # Extract the final message content
+        final_message = result["messages"][-1].content
+
+        # Add result to step results
+        # aggregated_result = f"Working on: '{next_item}' -> {final_message}"
+        state["step_results"].append(final_message)
         state["completed_todos"].append(next_item)
-        return {**state, "step_count": state["step_count"] + 1}
 
-    # Process all tool calls and aggregate results
-    tool_results = []
-    for tool_call in response.tool_calls:
-        # print(">>>>> tool_call ", tool_call)
-        name = tool_call["name"]
-        args = tool_call["args"]
+    except Exception as e:
+        error_result = f"Error processing '{next_item}': {str(e)}"
+        state["step_results"].append(error_result)
+        state["completed_todos"].append(next_item)
 
-        if name == "search_web":
-            result = search_web.invoke(args["query"])
-        elif name == "summarize_text":
-            result = summarize_text.invoke(args["text"])
-        else:
-            result = f"Unknown tool: {name}"
-
-        tool_results.append(f"[{name}] {result}")
-
-    # Aggregate all tool results for this step
-    aggregated_result = f"Working on: '{next_item}' -> " + " | ".join(tool_results)
-    state["step_results"].append(aggregated_result)
-    state["completed_todos"].append(next_item)
     return {**state, "step_count": state["step_count"] + 1}
 
 
@@ -210,7 +175,7 @@ Here is the TODO.md:
     model = ChatOpenAI(model="gpt-4.1-mini", temperature=None)
     response = model.invoke(messages)
     updated_todo = response.content
-
+    print(updated_todo)
     return {**state, "todo_md": updated_todo}
 
 
@@ -237,10 +202,13 @@ if __name__ == "__main__":
     state = initialize_agent(user_task)
     agent = build_agent()
 
-    final_state = None
-    for step in agent.stream(state, stream_mode="values"):
-        print(f"\n🔁 Step {step['step_count']} — TODO.md:\n{step['todo_md']}\n")
-        final_state = step
+    final_state = agent.invoke(state)
+    # print(json.dumps(response, indent=2))
+    # print(response["step_results"][-1])
+    # final_state = None
+    # for step in agent.stream(state, stream_mode="values"):
+    #     print(f"\n🔁 Step {step['step_count']} — TODO.md:\n{step['todo_md']}\n")
+    #     final_state = step
 
     print("\n" + "=" * 50)
     print("🎯 FINAL RESULTS")
