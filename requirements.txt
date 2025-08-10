@@ -8,3 +8,4 @@ langgraph
 langchain-openai
 exa-py
 python-dotenv
+langchain-tavily
